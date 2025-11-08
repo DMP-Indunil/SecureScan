@@ -8,10 +8,21 @@ import csv
 import sys
 import os
 import struct
+import re
+import ipaddress
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from scapy.all import sr, IP, TCP, sr1
+
+# Try importing scapy, handle if not installed
+try:
+    from scapy.all import sr, IP, TCP, sr1
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    print("⚠️  WARNING: Scapy is not installed. Advanced scan types (SYN, FIN, XMAS, NULL) will not be available.")
+    print("Install it with: pip install scapy")
+    print("Only CONNECT scan will be available.\n")
 
 # Scan types
 class ScanType(Enum):
@@ -58,6 +69,82 @@ COMMON_PORTS = {
 
 # Global results list to store scan findings
 scan_results = []
+
+# Validation Functions
+def is_valid_ip(ip):
+    """Validate IP address format"""
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        return False
+
+def is_valid_port(port):
+    """Validate port number"""
+    return 1 <= port <= 65535
+
+def is_admin():
+    """Check if the script is running with administrator/root privileges"""
+    try:
+        if os.name == 'nt':  # Windows
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:  # Linux/Unix/Mac
+            return os.geteuid() == 0
+    except Exception:
+        return False
+
+def validate_arguments(args):
+    """Validate all command-line arguments"""
+    errors = []
+    
+    # Validate IP address
+    if not is_valid_ip(args.target):
+        errors.append(f"❌ Invalid IP address: {args.target}")
+    
+    # Validate port range
+    try:
+        port_range = args.ports.split("-")
+        if len(port_range) != 2:
+            errors.append(f"❌ Invalid port range format: {args.ports}. Use format: START-END (e.g., 1-1000)")
+        else:
+            start_port = int(port_range[0])
+            end_port = int(port_range[1])
+            
+            if not is_valid_port(start_port):
+                errors.append(f"❌ Invalid start port: {start_port}. Must be between 1-65535")
+            if not is_valid_port(end_port):
+                errors.append(f"❌ Invalid end port: {end_port}. Must be between 1-65535")
+            if start_port > end_port:
+                errors.append(f"❌ Start port ({start_port}) cannot be greater than end port ({end_port})")
+    except ValueError:
+        errors.append(f"❌ Port range must contain numbers: {args.ports}")
+    
+    # Validate threads
+    if args.threads < 1:
+        errors.append(f"❌ Thread count must be at least 1, got: {args.threads}")
+    elif args.threads > 1000:
+        errors.append(f"⚠️  WARNING: Thread count of {args.threads} is very high and may cause issues")
+    
+    # Validate scan type with scapy availability
+    if args.scan_type != "connect" and not SCAPY_AVAILABLE:
+        errors.append(f"❌ Scan type '{args.scan_type}' requires Scapy. Install with: pip install scapy")
+    
+    # Check admin privileges for advanced scans
+    if args.scan_type != "connect" and not is_admin():
+        errors.append(f"⚠️  WARNING: '{args.scan_type}' scan requires administrator/root privileges")
+    
+    # Validate output file if specified
+    if args.output_file:
+        if args.output == "text":
+            errors.append(f"⚠️  WARNING: --output-file is ignored when output format is 'text'")
+        
+        # Check if directory exists
+        output_dir = os.path.dirname(args.output_file)
+        if output_dir and not os.path.exists(output_dir):
+            errors.append(f"❌ Output directory does not exist: {output_dir}")
+    
+    return errors
 
 def get_service_banner(ip, port, timeout=2):
     """Attempt to grab service banner from the specified port"""
@@ -128,9 +215,15 @@ def scan_port_connect(ip, port, identify=True, output_format="text"):
                     print(f"[+] Port {port} is OPEN: {service}")
                     
         sock.close()
+    except socket.gaierror:
+        if output_format == "text":
+            print(f"[-] Could not resolve hostname for {ip}")
+    except socket.error as e:
+        if output_format == "text":
+            print(f"[-] Socket error on port {port}: {e}")
     except Exception as e:
         if output_format == "text":
-            print(f"[-] Error scanning port {port}: {e}")
+            print(f"[-] Unexpected error scanning port {port}: {e}")
 
 def scan_port_syn(ip, port, identify=True, output_format="text"):
     """SYN scan (half-open)"""
@@ -280,9 +373,28 @@ def export_results(output_format, output_file=None):
             print("\n".join(output))
 
 def main():
-    parser = argparse.ArgumentParser(description="SecureScan - Advanced Port Scanner with Multiple Techniques")
+    parser = argparse.ArgumentParser(
+        description="SecureScan - Advanced Port Scanner with Multiple Techniques",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Basic scan:
+    python scanner.py --target 192.168.1.1 --ports 1-1000
+  
+  Fast multi-threaded scan:
+    python scanner.py --target 192.168.1.1 --ports 1-1000 --threads 100
+  
+  SYN scan with JSON output:
+    python scanner.py --target 192.168.1.1 --ports 1-1000 --scan-type syn --output json --output-file results.json
+  
+  Stealth FIN scan:
+    python scanner.py --target 192.168.1.1 --ports 1-1000 --scan-type fin
+
+Note: Advanced scan types (SYN, FIN, XMAS, NULL) require administrator/root privileges.
+        """
+    )
     parser.add_argument("--target", required=True, help="Target IP address")
-    parser.add_argument("--ports", required=True, help="Port range (e.g., 20-100)")
+    parser.add_argument("--ports", required=True, help="Port range (e.g., 1-1000)")
     parser.add_argument("--threads", type=int, default=50, help="Number of threads (default: 50)")
     parser.add_argument("--no-identify", action="store_true", help="Skip service identification")
     parser.add_argument("--scan-type", choices=["connect", "syn", "fin", "xmas", "null"], default="connect",
@@ -290,34 +402,54 @@ def main():
     parser.add_argument("--output", choices=["text", "json", "csv"], default="text",
                         help="Output format (default: text)")
     parser.add_argument("--output-file", help="File to save results (only for json/csv output)")
-    args = parser.parse_args()
-
-    ip = args.target
-    port_range = args.ports.split("-")
-    start_port = int(port_range[0])
-    end_port = int(port_range[1])
-    thread_count = min(args.threads, (end_port - start_port + 1))  # Ensure we don't create more threads than ports
     
-    # Check if we need elevated privileges for SYN, FIN, XMAS or NULL scans
-    scan_type = ScanType(args.scan_type)
-    if scan_type != ScanType.CONNECT:
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        return
+    
+    # Validate arguments
+    validation_errors = validate_arguments(args)
+    
+    # Separate critical errors from warnings
+    critical_errors = [e for e in validation_errors if e.startswith("❌")]
+    warnings = [e for e in validation_errors if e.startswith("⚠️")]
+    
+    # Display warnings
+    if warnings:
+        for warning in warnings:
+            print(warning)
+        print()
+    
+    # Exit on critical errors
+    if critical_errors:
+        print("\n🛑 Critical errors found:\n")
+        for error in critical_errors:
+            print(error)
+        print("\nPlease fix the errors above and try again.")
+        sys.exit(1)
+    
+    # Ask for confirmation if there are warnings about privileges
+    if any("administrator/root privileges" in w for w in warnings):
         try:
-            # Windows doesn't have os.geteuid(), use a more cross-platform approach
-            is_admin = False
-            if os.name == 'nt':
-                import ctypes
-                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-            else:
-                is_admin = os.geteuid() == 0
-                
-            if not is_admin:
-                print(f"\n⚠️  WARNING: {scan_type.value.upper()} scans typically require root/administrator privileges.")
-                print("You may not get accurate results without running as administrator/root.")
-                input("Press Enter to continue anyway or Ctrl+C to abort...")
-        except:
-            print(f"\n⚠️  WARNING: Could not determine if you have sufficient privileges for {scan_type.value.upper()} scans.")
-            print("You may not get accurate results without running as administrator/root.")
-            input("Press Enter to continue anyway or Ctrl+C to abort...")
+            response = input("Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Scan cancelled.")
+                sys.exit(0)
+        except KeyboardInterrupt:
+            print("\n\nScan cancelled by user.")
+            sys.exit(0)
+    
+    try:
+        ip = args.target
+        port_range = args.ports.split("-")
+        start_port = int(port_range[0])
+        end_port = int(port_range[1])
+        thread_count = min(args.threads, (end_port - start_port + 1))  # Ensure we don't create more threads than ports
+        scan_type = ScanType(args.scan_type)
+    except Exception as e:
+        print(f"❌ Error parsing arguments: {e}")
+        sys.exit(1)
 
     identify_services = not args.no_identify
     output_format = args.output
@@ -332,17 +464,24 @@ def main():
     if identify_services and scan_type == ScanType.CONNECT:
         print("🔎 Service identification: Enabled")
     else:
-        print("� Service identification: Disabled")
+        print("🔎 Service identification: Disabled")
     print(f"📄 Output format: {output_format.upper()}")
     print("")
     
     start_time = time.time()
     
-    with ThreadPoolExecutor(max_workers=thread_count) as executor:
-        for port in range(start_port, end_port + 1):
-            # Only attempt service identification for CONNECT scans
-            identify = identify_services if scan_type == ScanType.CONNECT else False
-            executor.submit(scan_port, ip, port, identify, scan_type, output_format)
+    try:
+        with ThreadPoolExecutor(max_workers=thread_count) as executor:
+            for port in range(start_port, end_port + 1):
+                # Only attempt service identification for CONNECT scans
+                identify = identify_services if scan_type == ScanType.CONNECT else False
+                executor.submit(scan_port, ip, port, identify, scan_type, output_format)
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Scan interrupted by user (Ctrl+C)")
+        print(f"📊 Partial results collected: {len(scan_results)} open ports found")
+    except Exception as e:
+        print(f"\n\n❌ Error during scan: {e}")
+        print(f"📊 Partial results collected: {len(scan_results)} open ports found")
     
     duration = time.time() - start_time
     
@@ -357,8 +496,18 @@ def main():
         print(f"🔓 Open ports: {open_ports}")
     
     # Export results if needed
-    if output_format in ["json", "csv"]:
-        export_results(output_format, args.output_file)
+    try:
+        if output_format in ["json", "csv"]:
+            export_results(output_format, args.output_file)
+    except Exception as e:
+        print(f"\n❌ Error exporting results: {e}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Program terminated by user.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        sys.exit(1)
