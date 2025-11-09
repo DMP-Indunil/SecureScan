@@ -1,0 +1,11 @@
+# SecureScan Requirements
+# Install with: pip install -r requirements.txt
+
+# Network packet manipulation and crafting
+scapy>=2.5.0
+
+# Progress bar for better user experience (optional, for future use)
+tqdm>=4.66.0
+
+# For better colored terminal output (optional, for future use)
+colorama>=0.4.6
